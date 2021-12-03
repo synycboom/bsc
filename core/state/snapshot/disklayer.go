@@ -20,12 +20,20 @@ import (
 	"bytes"
 	"sync"
 
+	"github.com/ethereum/go-ethereum/log"
+
 	"github.com/VictoriaMetrics/fastcache"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
+)
+
+var (
+	diskLayerReadKeyMap       = make(map[string]bool)
+	totalKeyRead        int64 = 0
 )
 
 // diskLayer is a low level persistent snapshot built on top of a key-value store.
@@ -146,6 +154,12 @@ func (dl *diskLayer) Storage(accountHash, storageHash common.Hash) ([]byte, erro
 		return blob, nil
 	}
 	// Cache doesn't contain storage slot, pull from disk and cache for later
+	totalKeyRead += 1
+	diskLayerReadKeyMap[string(key)] = true
+	if totalKeyRead%100000 == 0 {
+		log.Info("disk layer key read stats", "total", totalKeyRead, "unique", len(diskLayerReadKeyMap))
+	}
+
 	blob := rawdb.ReadStorageSnapshot(dl.diskdb, accountHash, storageHash)
 	dl.cache.Set(key, blob)
 

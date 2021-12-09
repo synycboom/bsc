@@ -2,6 +2,7 @@
 package tikvdb
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/ethereum/go-ethereum/metrics"
 
 	"github.com/tikv/client-go/v2/config"
+	"github.com/tikv/client-go/v2/rawkv"
 	"github.com/tikv/client-go/v2/tikv"
 )
 
@@ -30,8 +32,10 @@ const (
 // functionality it also supports batch writes and iterating over the keyspace in
 // binary-alphabetical order.
 type Database struct {
-	fn string            // filename for reporting
-	db *tikv.RawKVClient // LevelDB instance
+	fn     string // filename for reporting
+	db     *rawkv.Client
+	txnDB  *tikv.KVStore
+	useTxn bool
 
 	compTimeMeter      metrics.Meter // Meter for measuring the total time spent in database compaction
 	compReadMeter      metrics.Meter // Meter for measuring the data read during compaction
@@ -52,27 +56,27 @@ type Database struct {
 	log log.Logger // Contextual logger tracking the database path
 }
 
-// New returns a wrapped Tikv object. The namespace is the prefix that the
-// metrics reporting should use for surfacing internal stats.
-func New(file string, namespace string, pdAddrs []string) (*Database, error) {
-	return NewCustom(file, namespace, pdAddrs)
-}
-
 // NewCustom returns a wrapped Tikv object. The namespace is the prefix that the
 // metrics reporting should use for surfacing internal stats.
-// The customize function allows the caller to modify the tikv options.
-func NewCustom(file string, namespace string, pdAddrs []string) (*Database, error) {
+func New(file string, namespace string, pdAddrs []string, useTxn bool) (*Database, error) {
 	logger := log.New("database", file)
-	db, err := tikv.NewRawKVClient(pdAddrs, config.DefaultConfig().Security)
+	txnDb, err := tikv.NewTxnClient(pdAddrs)
+	if err != nil {
+		return nil, err
+	}
+
+	db, err := rawkv.NewClient(context.Background(), pdAddrs, config.DefaultConfig().Security)
 	if err != nil {
 		return nil, err
 	}
 
 	// Assemble the wrapper with all the registered metrics
 	ldb := &Database{
-		fn:       file,
 		db:       db,
+		fn:       file,
 		log:      logger,
+		txnDB:    txnDb,
+		useTxn:   useTxn,
 		quitChan: make(chan chan error),
 	}
 	ldb.compTimeMeter = metrics.NewRegisteredMeter(namespace+"compact/time", nil)
@@ -89,7 +93,8 @@ func NewCustom(file string, namespace string, pdAddrs []string) (*Database, erro
 	ldb.seekCompGauge = metrics.NewRegisteredGauge(namespace+"compact/seek", nil)
 
 	// Start up the metrics gathering and return
-	// go ldb.meter(metricsGatheringInterval)
+	go ldb.meter(metricsGatheringInterval)
+
 	return ldb, nil
 }
 
@@ -109,40 +114,264 @@ func (db *Database) Close() error {
 		db.quitChan = nil
 	}
 
-	return db.db.Close()
+	if err := db.txnDB.Close(); err != nil {
+		return err
+	}
+	if err := db.db.Close(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // Has retrieves if a key is present in the key-value store.
 func (db *Database) Has(key []byte) (bool, error) {
-	val, err := db.db.Get(key)
-	if err != nil {
-		return false, err
+	if db.useTxn {
+		return db.txnHas(key)
 	}
 
-	return val != nil, nil
+	return db.rawKVHas(key)
 }
 
 // Get retrieves the given key if it's present in the key-value store.
 func (db *Database) Get(key []byte) ([]byte, error) {
-	val, err := db.db.Get(key)
-	if err != nil {
-		return nil, err
+	if db.useTxn {
+		return db.txnGet(key)
 	}
 
-	return val, nil
+	return db.rawKVGet(key)
 }
 
 // Put inserts the given value into the key-value store.
 func (db *Database) Put(key []byte, value []byte) error {
-	return db.db.Put(key, value)
+	if db.useTxn {
+		return db.txnPut(key, value)
+	}
+
+	return db.rawKVPut(key, value)
 }
 
 // Delete removes the key from the key-value store.
 func (db *Database) Delete(key []byte) error {
-	return db.db.Delete(key)
+	if db.useTxn {
+		return db.txnDelete(key)
+	}
+
+	return db.rawKVDelete(key)
 }
 
 // Compact is implemented
 func (db *Database) Compact(start []byte, limit []byte) error {
 	return nil
+}
+
+// Stat returns a particular internal stat of the database.
+func (db *Database) Stat(property string) (string, error) {
+	// TODO: Check this
+	return "", nil
+	// return db.db.GetProperty(property)
+}
+
+// meter periodically retrieves internal leveldb counters and reports them to
+// the metrics subsystem.
+//
+// This is how a LevelDB stats table looks like (currently):
+//   Compactions
+//    Level |   Tables   |    Size(MB)   |    Time(sec)  |    Read(MB)   |   Write(MB)
+//   -------+------------+---------------+---------------+---------------+---------------
+//      0   |          0 |       0.00000 |       1.27969 |       0.00000 |      12.31098
+//      1   |         85 |     109.27913 |      28.09293 |     213.92493 |     214.26294
+//      2   |        523 |    1000.37159 |       7.26059 |      66.86342 |      66.77884
+//      3   |        570 |    1113.18458 |       0.00000 |       0.00000 |       0.00000
+//
+// This is how the write delay look like (currently):
+// DelayN:5 Delay:406.604657ms Paused: false
+//
+// This is how the iostats look like (currently):
+// Read(MB):3895.04860 Write(MB):3654.64712
+func (db *Database) meter(refresh time.Duration) {
+	// Create the counters to store current and previous compaction values
+	compactions := make([][]float64, 2)
+	for i := 0; i < 2; i++ {
+		compactions[i] = make([]float64, 4)
+	}
+	// // Create storage for iostats.
+	// var iostats [2]float64
+
+	// // Create storage and warning log tracer for write delay.
+	// var (
+	// 	delaystats      [2]int64
+	// 	lastWritePaused time.Time
+	// )
+
+	var (
+		errc chan error
+		merr error
+	)
+
+	timer := time.NewTimer(refresh)
+	defer timer.Stop()
+
+	// Iterate ad infinitum and collect the stats
+	for i := 1; errc == nil && merr == nil; i++ {
+		// // Retrieve the database stats
+		// stats, err := db.db.GetProperty("leveldb.stats")
+		// if err != nil {
+		// 	db.log.Error("Failed to read database stats", "err", err)
+		// 	merr = err
+		// 	continue
+		// }
+		// // Find the compaction table, skip the header
+		// lines := strings.Split(stats, "\n")
+		// for len(lines) > 0 && strings.TrimSpace(lines[0]) != "Compactions" {
+		// 	lines = lines[1:]
+		// }
+		// if len(lines) <= 3 {
+		// 	db.log.Error("Compaction leveldbTable not found")
+		// 	merr = errors.New("compaction leveldbTable not found")
+		// 	continue
+		// }
+		// lines = lines[3:]
+
+		// // Iterate over all the leveldbTable rows, and accumulate the entries
+		// for j := 0; j < len(compactions[i%2]); j++ {
+		// 	compactions[i%2][j] = 0
+		// }
+		// for _, line := range lines {
+		// 	parts := strings.Split(line, "|")
+		// 	if len(parts) != 6 {
+		// 		break
+		// 	}
+		// 	for idx, counter := range parts[2:] {
+		// 		value, err := strconv.ParseFloat(strings.TrimSpace(counter), 64)
+		// 		if err != nil {
+		// 			db.log.Error("Compaction entry parsing failed", "err", err)
+		// 			merr = err
+		// 			continue
+		// 		}
+		// 		compactions[i%2][idx] += value
+		// 	}
+		// }
+		// // Update all the requested meters
+		// if db.diskSizeGauge != nil {
+		// 	db.diskSizeGauge.Update(int64(compactions[i%2][0] * 1024 * 1024))
+		// }
+		// if db.compTimeMeter != nil {
+		// 	db.compTimeMeter.Mark(int64((compactions[i%2][1] - compactions[(i-1)%2][1]) * 1000 * 1000 * 1000))
+		// }
+		// if db.compReadMeter != nil {
+		// 	db.compReadMeter.Mark(int64((compactions[i%2][2] - compactions[(i-1)%2][2]) * 1024 * 1024))
+		// }
+		// if db.compWriteMeter != nil {
+		// 	db.compWriteMeter.Mark(int64((compactions[i%2][3] - compactions[(i-1)%2][3]) * 1024 * 1024))
+		// }
+		// // Retrieve the write delay statistic
+		// writedelay, err := db.db.GetProperty("leveldb.writedelay")
+		// if err != nil {
+		// 	db.log.Error("Failed to read database write delay statistic", "err", err)
+		// 	merr = err
+		// 	continue
+		// }
+		// var (
+		// 	delayN        int64
+		// 	delayDuration string
+		// 	duration      time.Duration
+		// 	paused        bool
+		// )
+		// if n, err := fmt.Sscanf(writedelay, "DelayN:%d Delay:%s Paused:%t", &delayN, &delayDuration, &paused); n != 3 || err != nil {
+		// 	db.log.Error("Write delay statistic not found")
+		// 	merr = err
+		// 	continue
+		// }
+		// duration, err = time.ParseDuration(delayDuration)
+		// if err != nil {
+		// 	db.log.Error("Failed to parse delay duration", "err", err)
+		// 	merr = err
+		// 	continue
+		// }
+		// if db.writeDelayNMeter != nil {
+		// 	db.writeDelayNMeter.Mark(delayN - delaystats[0])
+		// }
+		// if db.writeDelayMeter != nil {
+		// 	db.writeDelayMeter.Mark(duration.Nanoseconds() - delaystats[1])
+		// }
+		// // If a warning that db is performing compaction has been displayed, any subsequent
+		// // warnings will be withheld for one minute not to overwhelm the user.
+		// if paused && delayN-delaystats[0] == 0 && duration.Nanoseconds()-delaystats[1] == 0 &&
+		// 	time.Now().After(lastWritePaused.Add(degradationWarnInterval)) {
+		// 	db.log.Warn("Database compacting, degraded performance")
+		// 	lastWritePaused = time.Now()
+		// }
+		// delaystats[0], delaystats[1] = delayN, duration.Nanoseconds()
+
+		// // Retrieve the database iostats.
+		// ioStats, err := db.db.GetProperty("leveldb.iostats")
+		// if err != nil {
+		// 	db.log.Error("Failed to read database iostats", "err", err)
+		// 	merr = err
+		// 	continue
+		// }
+		// var nRead, nWrite float64
+		// parts := strings.Split(ioStats, " ")
+		// if len(parts) < 2 {
+		// 	db.log.Error("Bad syntax of ioStats", "ioStats", ioStats)
+		// 	merr = fmt.Errorf("bad syntax of ioStats %s", ioStats)
+		// 	continue
+		// }
+		// if n, err := fmt.Sscanf(parts[0], "Read(MB):%f", &nRead); n != 1 || err != nil {
+		// 	db.log.Error("Bad syntax of read entry", "entry", parts[0])
+		// 	merr = err
+		// 	continue
+		// }
+		// if n, err := fmt.Sscanf(parts[1], "Write(MB):%f", &nWrite); n != 1 || err != nil {
+		// 	db.log.Error("Bad syntax of write entry", "entry", parts[1])
+		// 	merr = err
+		// 	continue
+		// }
+		// if db.diskReadMeter != nil {
+		// 	db.diskReadMeter.Mark(int64((nRead - iostats[0]) * 1024 * 1024))
+		// }
+		// if db.diskWriteMeter != nil {
+		// 	db.diskWriteMeter.Mark(int64((nWrite - iostats[1]) * 1024 * 1024))
+		// }
+		// iostats[0], iostats[1] = nRead, nWrite
+
+		// compCount, err := db.db.GetProperty("leveldb.compcount")
+		// if err != nil {
+		// 	db.log.Error("Failed to read database iostats", "err", err)
+		// 	merr = err
+		// 	continue
+		// }
+
+		// var (
+		// 	memComp       uint32
+		// 	level0Comp    uint32
+		// 	nonLevel0Comp uint32
+		// 	seekComp      uint32
+		// )
+		// if n, err := fmt.Sscanf(compCount, "MemComp:%d Level0Comp:%d NonLevel0Comp:%d SeekComp:%d", &memComp, &level0Comp, &nonLevel0Comp, &seekComp); n != 4 || err != nil {
+		// 	db.log.Error("Compaction count statistic not found")
+		// 	merr = err
+		// 	continue
+		// }
+		// db.memCompGauge.Update(int64(memComp))
+		// db.level0CompGauge.Update(int64(level0Comp))
+		// db.nonlevel0CompGauge.Update(int64(nonLevel0Comp))
+		// db.seekCompGauge.Update(int64(seekComp))
+
+		// Sleep a bit, then repeat the stats collection
+		select {
+		case errc = <-db.quitChan:
+			// Quit requesting, stop hammering the database
+		case <-timer.C:
+			timer.Reset(refresh)
+			// Timeout, gather a new set of stats
+		}
+	}
+
+	if errc == nil {
+		errc = <-db.quitChan
+	}
+
+	errc <- merr
 }

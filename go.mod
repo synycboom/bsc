@@ -39,9 +39,11 @@ require (
 	github.com/holiman/bloomfilter/v2 v2.0.3
 	github.com/holiman/uint256 v1.1.1
 	github.com/huin/goupnp v1.0.1-0.20210310174557-0ca763054c88
+	github.com/hypnoglow/gormzap v0.3.0 // indirect
 	github.com/influxdata/influxdb v1.8.3
 	github.com/jackpal/go-nat-pmp v1.0.2-0.20160603034137-1fa385a6f458
 	github.com/jedisct1/go-minisign v0.0.0-20190909160543-45766022959e
+	github.com/jinzhu/gorm v1.9.12 // indirect
 	github.com/jmhodges/levigo v1.0.0 // indirect
 	github.com/julienschmidt/httprouter v1.2.0
 	github.com/karalabe/usb v0.0.0-20190919080040-51dc0efba356
@@ -56,6 +58,7 @@ require (
 	github.com/oxtoacart/bpool v0.0.0-20190530202638-03653db5a59c
 	github.com/panjf2000/ants/v2 v2.4.5
 	github.com/peterh/liner v1.1.1-0.20190123174540-a2c9a5303de7
+	github.com/pingcap/parser v0.0.0-20210525032559-c37778aff307 // indirect
 	github.com/prometheus/tsdb v0.7.1
 	github.com/rcrowley/go-metrics v0.0.0-20190826022208-cac0b30c2563 // indirect
 	github.com/rjeczalik/notify v0.9.1
@@ -67,13 +70,13 @@ require (
 	github.com/tendermint/go-amino v0.14.1
 	github.com/tendermint/iavl v0.12.0
 	github.com/tendermint/tendermint v0.31.11
-	github.com/tikv/client-go/v2 v2.0.0-alpha // indirect
+	github.com/tikv/client-go/v2 v2.0.0-rc // indirect
 	github.com/tklauser/go-sysconf v0.3.5 // indirect
 	github.com/tyler-smith/go-bip39 v1.0.1-0.20181017060643-dbb3b84ba2ef
 	go.etcd.io/bbolt v1.3.5 // indirect
 	golang.org/x/crypto v0.0.0-20210322153248-0c34fe9e7dc2
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
-	golang.org/x/sys v0.0.0-20210420205809-ac73e9fd8988
+	golang.org/x/sys v0.0.0-20210831042530-f4d43177bf5e
 	golang.org/x/text v0.3.6
 	golang.org/x/time v0.0.0-20201208040808-7e3f01d25324
 	google.golang.org/grpc v1.27.1 // indirect

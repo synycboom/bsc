@@ -24,12 +24,39 @@ import (
 )
 
 func TestLevelDB(t *testing.T) {
-	t.Run("DatabaseSuite", func(t *testing.T) {
+	var useTxn = true
+	var cleanUp = func(db *Database) {
+		it := db.NewIterator(nil, nil)
+		defer it.Release()
+
+		for it.Next() {
+			if err := db.Delete(it.Key()); err != nil {
+				panic(err)
+			}
+		}
+	}
+
+	t.Run("DatabaseSuite(txn)", func(t *testing.T) {
 		dbtest.TestDatabaseSuite(t, func() ethdb.KeyValueStore {
-			db, err := New("", "", []string{"127.0.0.1:2379"})
+			db, err := New("", "", []string{"127.0.0.1:2379"}, useTxn)
 			if err != nil {
 				panic(err)
 			}
+
+			cleanUp(db)
+
+			return db
+		})
+	})
+
+	t.Run("DatabaseSuite(rawKV)", func(t *testing.T) {
+		dbtest.TestDatabaseSuite(t, func() ethdb.KeyValueStore {
+			db, err := New("", "", []string{"127.0.0.1:2379"}, !useTxn)
+			if err != nil {
+				panic(err)
+			}
+
+			cleanUp(db)
 
 			return db
 		})
